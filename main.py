@@ -1,5 +1,6 @@
 import json
-import logging
+from utils.log import get_logger
+logger = get_logger()
 import psycopg2
 import pika
 import time
