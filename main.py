@@ -8,9 +8,6 @@ import os
 from uuid import uuid4
 from datetime import datetime
 
-logger = logging.getLogger(__name__)
-
-
 
 RABBITMQ_HOST = os.getenv('RABBITMQ_HOST')
 RabbitMQ_PORT = os.getenv('RABBITMQ_PORT')
