@@ -18,26 +18,64 @@ PG_AIRLINES_DB = os.getenv('PG_AIRLINES_DB')
 PG_USER = os.getenv('PG_USER')
 PG_PASSWORD = os.getenv('PG_PASSWORD')
 
+
 AIRLINE_ENGINE_PARSER_OUTPUT_Q_RABBITMQ = "airline_engine_scraper_status_q"
 
 
 # --- Database connection ---
 def get_db_connection():
     return psycopg2.connect(
-        host=PG_HOST,
-        # host='10.200.20.73',
+        # host=PG_HOST,
+        host='10.200.20.73',
         database=PG_AIRLINES_DB,
         user=PG_USER,
         password=PG_PASSWORD
     )
+
+from datetime import datetime
+
+def to_float(v):
+            try:
+                return float(v) if v not in (None, "", " ") else 0.0
+            except Exception:
+                return 0.0
+
+def normalize_date(date_value):
+    """
+    Converts 'DD-MM-YYYY' or 'DD/MM/YYYY' or already valid ISO date into 'YYYY-MM-DD'.
+    Returns None if invalid or empty.
+    """
+    if not date_value:
+        return None
+
+    if isinstance(date_value, datetime):
+        return date_value.date()  # already a datetime
+
+    if isinstance(date_value, str):
+        date_value = date_value.strip()
+        for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(date_value, fmt).date()
+            except ValueError:
+                continue
+    return None
+
+def normalize_numeric(value):
+    """Convert empty strings or invalid numerics to None or float"""
+    if value in (None, "", " ", "NA", "N/A", "-", "--"):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
 
 # --- Create RabbitMQ channel ---
 def create_rabbitmq_channel(queue_name):
     credentials = pika.PlainCredentials('finkraft', 'finkai@123')
     connection = pika.BlockingConnection(
         pika.ConnectionParameters(
-            host=RABBITMQ_HOST,
-            # host='10.200.20.83',
+            # host=RABBITMQ_HOST,
+            host='10.200.20.83',
             port=RabbitMQ_PORT,
             virtual_host='/',
             credentials=credentials
@@ -46,6 +84,193 @@ def create_rabbitmq_channel(queue_name):
     channel = connection.channel()
     channel.queue_declare(queue=queue_name, durable=True)
     return channel
+
+
+def select_and_update_matcher(target_table, matched_guid, record, invoice_guid, ticket_number, pnr, connection, cursor):
+    """
+    Fetch detailed data from airline_engine_booking or indigo_scraper_priority,
+    combine with parsed invoice data, and insert into airline_engine_data_matcher.
+    """
+    import uuid
+    from datetime import datetime
+    invoice_guid = invoice_guid
+    try:
+        logger.info(f"[MATCHER START] Target Table: {target_table}, GUID: {matched_guid}")
+
+        # -----------------------------
+        # 1️⃣ Fetch data from target table
+        # -----------------------------
+        if target_table == "airline_engine_booking":
+            cursor.execute("""
+                SELECT 
+                    airline_name,
+                    za_data->>'Type' AS type,
+                    za_data->>'Financial Year' AS financial_year,
+                    (za_data->>'Transaction_Date') AS transaction_date,
+                    za_data->>'Workspace' AS workspace,
+                    za_data->>'Ticket_Number' AS ticket_number,
+                    za_data->>'PNR' AS pnr,
+                    za_data->>'Ticket/PNR' AS ticket_pnr,
+                    (za_data->>'Transaction_Amount') AS transaction_amount,
+                    za_data->>'Traveller Name' AS traveller_name,
+                    za_data->>'Class' AS class,
+                    za_data->>'Customer_GSTIN' AS customer_gstin,
+                    za_data->>'Agency_Invoice_Number' AS agency_invoice_number,
+                    za_data->>'Location' AS location,
+                    za_data->>'Domestic/International' AS domestic_international,
+                    (za_data->>'GST_Rate') AS gst_rate,
+                    za_data->>'Origin' AS origin,
+                    (za_data->>'Booking_GST') AS booking_gst,
+                    (za_data->>'K3') AS k3,
+                    za_data->>'Invoice - Name as per GST portal' AS invoice_name_as_per_gst_portal,
+                    za_data->>'Supplier_GSTIN' AS supplier_gstin
+                FROM airline_engine_booking
+                WHERE za_data->>'Ticket/PNR' = %s OR za_data->>'Ticket/PNR' = %s
+            """, (ticket_number, pnr))
+            booking_row = cursor.fetchone()
+
+        elif target_table == "indigo_scraper_priority":
+            cursor.execute("""
+                SELECT 
+                    'indigo' AS airline_name,
+                    "FY" AS financial_year,
+                    "Transaction_Date" AS transaction_date,
+                    "Workspace" AS workspace,
+                    "Ticket/PNR" AS ticket_number,
+                    "Ticket/PNR" AS pnr,
+                    "Ticket/PNR" AS ticket_pnr,
+                    NULL AS transaction_amount,
+                    traveller_name,
+                    NULL AS class,
+                    "Customer_GSTIN" AS customer_gstin,
+                    NULL AS agency_invoice_number,
+                    Origin AS location,
+                    NULL AS domestic_international,
+                    NULL AS gst_rate,
+                    Origin AS origin,
+                    NULL AS booking_gst,
+                    NULL AS k3,
+                    NULL AS invoice_name_as_per_gst_portal,
+                    NULL AS supplier_gstin
+                FROM indigo_scraper_priority
+                WHERE "Ticket/PNR" = %s OR "Ticket/PNR" = %s
+            """, (ticket_number, pnr))
+            booking_row = cursor.fetchone()
+        else:
+            logger.warning(f"Unknown target_table: {target_table}")
+            return
+
+        if not booking_row:
+            logger.warning(f"No record found in {target_table} for {ticket_number}/{pnr}")
+            return
+
+        booking_columns = [desc[0] for desc in cursor.description]
+        booking_data = dict(zip(booking_columns, booking_row))
+
+        # -----------------------------
+        # 2️⃣ Get parsed data (from AI extraction)
+        # -----------------------------
+        # Extract values safely
+        igst = to_float(record.get("igst_amount"))
+        cgst = to_float(record.get("cgst_amount"))
+        sgst = to_float(record.get("sgst_amount"))
+        igst_rate = to_float(record.get("igst_rate"))
+        cgst_rate = to_float(record.get("cgst_rate"))
+        sgst_rate = to_float(record.get("sgst_rate"))
+
+        parsed_data = {
+            "invoice_number": record.get("airline_invoice_number") or record.get("credit_debit_number"),
+            "invoice_date": record.get("airline_invoice_date") or record.get("credit_debit_date"),
+            "original_invoice_number": record.get("original_invoice_number"),
+            "tax_rate": igst_rate + cgst_rate + sgst_rate,
+            "taxable": record.get("taxable_value"),
+            "cgst": record.get("cgst_amount"),
+            "sgst": record.get("sgst_amount"),
+            "igst": record.get("igst_amount"),
+            "gst_amount": igst + cgst + sgst,
+            "total_amount": record.get("total_amount"),
+            "supplier_gstin": record.get("customer_gst_number"),
+        }
+
+        # -----------------------------
+        # 3️⃣ Combine all fields for insertion
+        # -----------------------------
+        insert_data = {
+            "id": str(uuid.uuid4()),
+            **booking_data,   # from either booking or indigo table
+            **parsed_data,     # parsed values from invoice
+            "invoice_guid" : invoice_guid
+        }
+        insert_data["transaction_date"] = normalize_date(insert_data.get("transaction_date"))
+        insert_data["invoice_date"] = normalize_date(insert_data.get("invoice_date"))
+        # normalize numeric values
+        for num_field in ["gst_rate", "tax_rate", "taxable", "cgst", "sgst", "igst", "gst_amount", "total_amount", "booking_gst", "k3"]:
+            insert_data[num_field] = normalize_numeric(insert_data.get(num_field))
+
+
+        insert_query = """
+            INSERT INTO airline_engine_data_matcher (
+                id,
+                airline_name, type, financial_year, transaction_date, workspace,
+                ticket_number, pnr, ticket_pnr, transaction_amount, traveller_name,
+                class, customer_gstin, agency_invoice_number, location, domestic_international,
+                gst_rate, origin, booking_gst, k3, invoice_name_as_per_gst_portal, supplier_gstin,
+                invoice_number, invoice_date, original_invoice_number, tax_rate,
+                taxable, cgst, sgst, igst, gst_amount, total_amount,invoice_guid
+            )
+            VALUES (
+                %(id)s,
+                %(airline_name)s, %(type)s, %(financial_year)s, %(transaction_date)s, %(workspace)s,
+                %(ticket_number)s, %(pnr)s, %(ticket_pnr)s, %(transaction_amount)s, %(traveller_name)s,
+                %(class)s, %(customer_gstin)s, %(agency_invoice_number)s, %(location)s, %(domestic_international)s,
+                %(gst_rate)s, %(origin)s, %(booking_gst)s, %(k3)s, %(invoice_name_as_per_gst_portal)s, %(supplier_gstin)s,
+                %(invoice_number)s, %(invoice_date)s, %(original_invoice_number)s, %(tax_rate)s,
+                %(taxable)s, %(cgst)s, %(sgst)s, %(igst)s, %(gst_amount)s, %(total_amount)s , %(invoice_guid)s
+            )
+            ON CONFLICT (invoice_guid)
+            DO UPDATE SET
+                airline_name = EXCLUDED.airline_name,
+                type = EXCLUDED.type,
+                financial_year = EXCLUDED.financial_year,
+                transaction_date = EXCLUDED.transaction_date,
+                workspace = EXCLUDED.workspace,
+                ticket_number = EXCLUDED.ticket_number,
+                pnr = EXCLUDED.pnr,
+                ticket_pnr = EXCLUDED.ticket_pnr,
+                transaction_amount = EXCLUDED.transaction_amount,
+                traveller_name = EXCLUDED.traveller_name,
+                class = EXCLUDED.class,
+                customer_gstin = EXCLUDED.customer_gstin,
+                agency_invoice_number = EXCLUDED.agency_invoice_number,
+                location = EXCLUDED.location,
+                domestic_international = EXCLUDED.domestic_international,
+                gst_rate = EXCLUDED.gst_rate,
+                origin = EXCLUDED.origin,
+                booking_gst = EXCLUDED.booking_gst,
+                k3 = EXCLUDED.k3,
+                invoice_name_as_per_gst_portal = EXCLUDED.invoice_name_as_per_gst_portal,
+                supplier_gstin = EXCLUDED.supplier_gstin,
+                invoice_number = EXCLUDED.invoice_number,
+                invoice_date = EXCLUDED.invoice_date,
+                original_invoice_number = EXCLUDED.original_invoice_number,
+                tax_rate = EXCLUDED.tax_rate,
+                taxable = EXCLUDED.taxable,
+                cgst = EXCLUDED.cgst,
+                sgst = EXCLUDED.sgst,
+                igst = EXCLUDED.igst,
+                gst_amount = EXCLUDED.gst_amount,
+                total_amount = EXCLUDED.total_amount,
+                invoice_guid = EXCLUDED.invoice_guid;
+        """
+
+        cursor.execute(insert_query, insert_data)
+        connection.commit()
+        logger.info(f"[MATCHER SUCCESS] Inserted/Updated record in airline_engine_data_matcher")
+
+    except Exception as e:
+        connection.rollback()
+        logger.exception(f"[MATCHER ERROR] Failed for {invoice_guid}: {e}")
+
 
 
 # --- Core processing for each message ---
@@ -138,7 +363,7 @@ def process_each_message(blob_info):
                             logger.info(f"No matching booking/indigo found for PNR: {pnr}")
 
                 # Try booking first
-                if booking_guid and not match:
+                if not match and booking_guid :
                     logger.info(f"searching in airline_engine_booking")
                     cursor.execute("""
                         SELECT guid, za_data->>'Transaction_Type'
@@ -164,6 +389,7 @@ def process_each_message(blob_info):
                 if match : 
                     logger.info(f"match found : {match}")
                     matched_guid, transaction_type = match
+                    select_and_update_matcher(target_table, matched_guid, record, invoice_guid, ticket_number, pnr, connection, cursor)
                 else : 
                     target_table = 'airline_za_scraper_parser_matching_table'
                     matched_guid = None
@@ -189,22 +415,20 @@ def process_each_message(blob_info):
                                 invoice_status,
                                 parsed_at,
                                 matched_at,
-                                file_hash,
-                                matched_guid
+                                file_hash
                             )
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
                             ON CONFLICT (invoice_guid)
                             DO UPDATE SET
                                 airline_name = EXCLUDED.airline_name,
                                 invoice_status = EXCLUDED.invoice_status,
                                 parsed_at = EXCLUDED.parsed_at,
                                 matched_at = EXCLUDED.matched_at,
-                                file_hash = EXCLUDED.file_hash,
-                                matched_guid = EXCLUDED.matched_guid;
+                                file_hash = EXCLUDED.file_hash;
                         """
                         cursor.execute(insert_query, (matched_guid,airline_name, invoice_guid, invoice_status,parsed_at,matched_at,invoice_filehash))
                         connection.commit()
-                        logger.info(f"Inserted or updated invoice_guid {invoice_guid} successfully")
+                        logger.info(f" Inserted or updated invoice_guid {invoice_guid} successfully")
 
                         logger.info(f"----> Inserted → airline_za_scraper_parser_matching_table ")
                         return 
@@ -265,22 +489,20 @@ def process_each_message(blob_info):
                         invoice_status,
                         parsed_at,
                         matched_at,
-                        file_hash,
-                        matched_guid
+                        file_hash
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (invoice_guid)
                     DO UPDATE SET
                         airline_name = EXCLUDED.airline_name,
                         invoice_status = EXCLUDED.invoice_status,
                         parsed_at = EXCLUDED.parsed_at,
                         matched_at = EXCLUDED.matched_at,
-                        file_hash = EXCLUDED.file_hash,
-                        matched_guid = EXCLUDED.matched_guid;
+                        file_hash = EXCLUDED.file_hash;
                 """
                 cursor.execute(insert_query, (matched_guid,airline_name, invoice_guid, invoice_status,parsed_at,matched_at,invoice_filehash))
                 connection.commit()
-                logger.info(f"Inserted or updated invoice_guid {invoice_guid} successfully")
+                logger.info(f" Inserted or updated invoice_guid {invoice_guid} successfully")
 
                 logger.info(f"----> Inserted → airline_za_scraper_parser_matching_table ")
                 return 
