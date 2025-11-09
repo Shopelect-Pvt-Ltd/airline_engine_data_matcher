@@ -124,13 +124,13 @@ def process_each_message(blob_info):
                             logger.info(f"No matching booking/indigo found for PNR: {pnr}")
 
                 elif not indigo_guid and t_airline_name == 'indigo' and ticket_number or pnr : 
-                    logger.info(f"searching in indigo_scraper_priority")
+                    logger.info(f"searching in indigo_scraper_priority with pnr")
                     cursor.execute("""
-                        SELECT guid, transaction_type
-                        FROM indigo_scraper_priority
-                        WHERE  ticket/pnr=%s or 
-                        ticket/pnr=%s or 
-                    """, (ticket_number ,pnr))
+                                        SELECT guid, "Transaction_Type"
+                                        FROM indigo_scraper_priority
+                                        WHERE "Ticket/PNR" = %s OR "Ticket/PNR" = %s
+                                    """, (ticket_number, pnr))
+
                     match = cursor.fetchone()
                     if match:
                         target_table = "indigo_scraper_priority"
@@ -138,7 +138,7 @@ def process_each_message(blob_info):
                             logger.info(f"No matching booking/indigo found for PNR: {pnr}")
 
                 # Try booking first
-                elif booking_guid:
+                if booking_guid and not match:
                     logger.info(f"searching in airline_engine_booking")
                     cursor.execute("""
                         SELECT guid, za_data->>'Transaction_Type'
@@ -149,7 +149,7 @@ def process_each_message(blob_info):
                     if match:
                         target_table = "airline_engine_booking"
 
-                elif not booking_guid and t_airline_name != 'indigo' and  ticket_number or pnr : 
+                elif not match and not booking_guid  and t_airline_name != 'indigo' and  ticket_number or pnr : 
                     logger.info(f"searching in airline_engine_booking")
                     cursor.execute("""
                         SELECT guid, za_data->>'Transaction_Type'
@@ -165,6 +165,7 @@ def process_each_message(blob_info):
                     logger.info(f"match found : {match}")
                     matched_guid, transaction_type = match
                 else : 
+                    target_table = 'airline_za_scraper_parser_matching_table'
                     matched_guid = None
                     transaction_type = None
                     # update_airline_za_parser_matching_table()
@@ -180,32 +181,43 @@ def process_each_message(blob_info):
                     invoice_filehash = f_file_hash
                     try : 
                         # insert final table of Airline_za_parser_matching_table
-                        insert_query = f"""
-                                            INSERT INTO airline_za_scraper_parser_matching_table (
-                                                guid,
-                                                airline_name,
-                                                invoice_guid,
-                                                invoice_status,
-                                                parsed_at,
-                                                matched_at,
-                                                file_hash
-                                            )
-                                            VALUES (%s, %s, %s, %s, %s, %s, %s)
-                                            ON CONFLICT (guid) DO NOTHING
-                                        """
-                        cursor.execute(insert_query, (guid,airline_name, invoice_guid, invoice_status,parsed_at,matched_at,invoice_filehash, matched_guid))
-                        connection.commit() 
+                        insert_query = """
+                        INSERT INTO airline_za_scraper_parser_matching_table (
+                                guid,
+                                airline_name,
+                                invoice_guid,
+                                invoice_status,
+                                parsed_at,
+                                matched_at,
+                                file_hash,
+                                matched_guid
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (invoice_guid)
+                            DO UPDATE SET
+                                airline_name = EXCLUDED.airline_name,
+                                invoice_status = EXCLUDED.invoice_status,
+                                parsed_at = EXCLUDED.parsed_at,
+                                matched_at = EXCLUDED.matched_at,
+                                file_hash = EXCLUDED.file_hash,
+                                matched_guid = EXCLUDED.matched_guid;
+                        """
+                        cursor.execute(insert_query, (matched_guid,airline_name, invoice_guid, invoice_status,parsed_at,matched_at,invoice_filehash))
+                        connection.commit()
+                        logger.info(f"Inserted or updated invoice_guid {invoice_guid} successfully")
+
                         logger.info(f"----> Inserted → airline_za_scraper_parser_matching_table ")
+                        return 
 
                     except Exception as e:
                         connection.rollback()  # rollback only this transaction
-                        logger.exception(f"❌ Error updating {target_table}: {e}")
+                        logger.exception(f" Error inserting  {target_table}: {e}")
 
                 # --- Determine invoice status ---
                 invoice_status = None
                 if transaction_type == "Invoice" and doc_type in ['INV','DB','BOS','BOS-DB']:
                     invoice_status = "invoice_received"
-                elif transaction_type == "Refund" and doc_type in ['CR','BOS-CR']:
+                elif transaction_type == "Refund" and doc_type in ['CR','BOS-CR','CN']:
                     invoice_status = "refund_received"
                 else:
                     logger.info(f"No matching status for {transaction_type}/{doc_type}")
@@ -244,29 +256,38 @@ def process_each_message(blob_info):
             invoice_filehash = f_file_hash
             
             try : 
-                logger.info(f"----> inserting in airline_za_scraper_parser_matching_table--")
                 # insert final table of Airline_za_parser_matching_table
-                insert_query = f"""
-                                    INSERT INTO airline_za_scraper_parser_matching_table (
-                                        guid,
-                                        airline_name,
-                                        invoice_guid,
-                                        invoice_status,
-                                        parsed_at,
-                                        matched_at,
-                                        file_hash
-                                    )
-                                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                                    ON CONFLICT (guid) DO NOTHING
-                                """
-
+                insert_query = """
+                INSERT INTO airline_za_scraper_parser_matching_table (
+                        guid,
+                        airline_name,
+                        invoice_guid,
+                        invoice_status,
+                        parsed_at,
+                        matched_at,
+                        file_hash,
+                        matched_guid
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (invoice_guid)
+                    DO UPDATE SET
+                        airline_name = EXCLUDED.airline_name,
+                        invoice_status = EXCLUDED.invoice_status,
+                        parsed_at = EXCLUDED.parsed_at,
+                        matched_at = EXCLUDED.matched_at,
+                        file_hash = EXCLUDED.file_hash,
+                        matched_guid = EXCLUDED.matched_guid;
+                """
                 cursor.execute(insert_query, (matched_guid,airline_name, invoice_guid, invoice_status,parsed_at,matched_at,invoice_filehash))
-                connection.commit()   # ✅ commit insert
+                connection.commit()
+                logger.info(f"Inserted or updated invoice_guid {invoice_guid} successfully")
+
                 logger.info(f"----> Inserted → airline_za_scraper_parser_matching_table ")
+                return 
 
             except Exception as e:
-                connection.rollback()
-                logger.error(f"----> Got error while inserting into airline_za_scraper_parser_matching_table: {e}")
+                connection.rollback()  # rollback only this transaction
+                logger.exception(f" Error inserting  {target_table}: {e}")
 
 
             logger.info(f"[PROCESS COMPLETE] GUID={parsed_guid} | Airline={t_airline_name} | Status={invoice_status} | FileHash={file_hash}")
